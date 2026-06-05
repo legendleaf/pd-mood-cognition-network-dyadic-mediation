@@ -1,38 +1,13 @@
-# R session and history
+# Participant-level analysis data
+analysis_*.csv
+data/*.csv
+data/*.tsv
+data/*.xlsx
+
+# Derived objects that may contain participant-level data
+*.RData
+results_network_analysis/data_processed/
+
+# Local/session files
 .Rhistory
-.Rapp.history
-.RData
-.Ruserdata
-.Rproj.user/
-*.Rproj
-
-# R package management
-renv/library/
-renv/local/
-renv/cellar/
-renv/lock/
-renv/python/
-renv/staging/
-
-# Generated outputs (re-created by running the scripts)
-results_network_analysis/
-results/
-
-# OS / editor
-.DS_Store
-Thumbs.db
-*.swp
-*~
-.idea/
-.vscode/
-
-# Temporary and backup files
-*.bak
-*.tmp
-*.log
-~$*
-
-# Sensitive / raw data (never commit)
-data/raw/
-*_raw.csv
-*_identifiable.csv
+自用/
