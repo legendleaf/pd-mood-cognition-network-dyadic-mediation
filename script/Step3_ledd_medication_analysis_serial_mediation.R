@@ -1,19 +1,20 @@
-# Step 3: Serial mediation - LEDD -> WOQ-9 -> NMS_mood -> PDQ39_SI
+# Step 3: Exploratory cross-sectional serial model.
+# The filename is retained for compatibility with the original workflow.
+source("script/Step0_DataPreparation.R")
 
 suppressPackageStartupMessages({
-  library(tidyverse)
+  library(dplyr)
+  library(readr)
   library(lavaan)
-  library(car)
   library(ggplot2)
 })
 
 # ---- config ----
 
-INPUT_PATIENTS <- "analysis_patients.csv"
-OUTPUT_DIR     <- "results_network_analysis"
+OUTPUT_DIR     <- PD_OUTPUT_DIR
 
 set.seed(2024)
-bootstrap_iter <- 5000
+bootstrap_iter <- pd_count("PD_SERIAL_BOOTSTRAP", 5000)
 export_pdf     <- TRUE
 png_dpi        <- 600
 
@@ -23,7 +24,7 @@ for (sub in c("figures/main", "figures/supplement", "tables", "data_processed"))
 
 # ---- data ----
 
-patients <- read_csv(INPUT_PATIENTS, show_col_types = FALSE)
+patients <- pd_patients
 
 required_vars <- c("LEDD", "WOQ9_total", "NMS_mood", "PDQ39_SI",
                    "age", "sex_male", "disease_duration")
@@ -31,9 +32,8 @@ missing_vars  <- setdiff(required_vars, names(patients))
 if (length(missing_vars) > 0)
   stop("Missing required variables: ", paste(missing_vars, collapse = ", "))
 
-analysis_data_raw <- patients %>%
-  dplyr::select(ID, all_of(required_vars)) %>%
-  na.omit()
+analysis_data_raw <- pd_complete(patients, c("ID", required_vars), "serial_model") %>%
+  dplyr::select(ID, all_of(required_vars))
 
 n_complete <- nrow(analysis_data_raw)
 
@@ -45,12 +45,21 @@ analysis_data <- analysis_data_raw %>%
 
 control_formula <- "age_z + sex_male + disease_duration_z"
 
-# ---- multicollinearity check (manuscript reports all VIF < 2.5) ----
+# ---- multicollinearity in each regression equation ----
 
-vif_model  <- lm(as.formula(paste("PDQ39_SI_z ~ LEDD_z + WOQ9_total_z + NMS_mood_z +",
-                                  control_formula)),
-                 data = analysis_data)
-vif_values <- vif(vif_model)
+vif_formulas <- c(
+  paste("WOQ9_total_z ~ LEDD_z +", control_formula),
+  paste("NMS_mood_z ~ WOQ9_total_z + LEDD_z +", control_formula),
+  paste("PDQ39_SI_z ~ WOQ9_total_z + NMS_mood_z + LEDD_z +", control_formula))
+vif_table <- bind_rows(lapply(vif_formulas, function(spec) {
+  predictors <- attr(terms(as.formula(spec)), "term.labels")
+  values <- vapply(predictors, function(v) {
+    auxiliary <- lm(reformulate(setdiff(predictors, v), v), data = analysis_data)
+    1/(1-summary(auxiliary)$r.squared)
+  }, numeric(1))
+  data.frame(equation = sub(" ~.*", "", spec), predictor = names(values), VIF = as.numeric(values))
+}))
+write_csv(vif_table, file.path(OUTPUT_DIR, "tables", "serial_equation_VIF.csv"))
 
 # ---- serial mediation SEM ----
 
@@ -65,12 +74,9 @@ serial_model_spec <- sprintf('
 
   total_indirect    := ind1_simple + ind2_serial + ind3_direct_m2
   total_effect      := c_prime + total_indirect
-  prop_mediated     := total_indirect / total_effect
-  serial_proportion := ind2_serial / total_indirect
 ', control_formula, control_formula, control_formula)
 
-fit_serial <- sem(serial_model_spec, data = analysis_data,
-                  se = "bootstrap", bootstrap = bootstrap_iter)
+fit_serial <- pd_fit_sem(serial_model_spec, analysis_data, "serial_corrected_si", bootstrap_iter)
 
 params <- parameterEstimates(fit_serial, boot.ci.type = "perc", ci = TRUE)
 
@@ -86,8 +92,6 @@ ind2        <- get_path("ind2_serial")
 ind3        <- get_path("ind3_direct_m2")
 total_ind   <- get_path("total_indirect")
 total_eff   <- get_path("total_effect")
-prop_med    <- get_path("prop_mediated")
-serial_prop <- get_path("serial_proportion")
 
 # ---- save results ----
 
@@ -102,35 +106,30 @@ results_table <- data.frame(
     "Indirect 1: LEDD -> WOQ9 -> PDQ39",
     "Indirect 2: LEDD -> WOQ9 -> NMS -> PDQ39 (SERIAL)",
     "Indirect 3: LEDD -> NMS -> PDQ39",
-    "Total Indirect",
-    "Total Effect",
-    "Proportion Mediated",
-    "Serial Proportion (of indirect)"
+    "Total indirect association",
+    "Total association"
   ),
   Beta_Standardized = c(path_a1$est, path_a2$est, path_d21$est,
                         path_b1$est, path_b2$est, path_c$est,
                         ind1$est, ind2$est, ind3$est,
-                        total_ind$est, total_eff$est,
-                        prop_med$est, serial_prop$est),
+                        total_ind$est, total_eff$est),
   CI_Lower = c(path_a1$ci.lower, path_a2$ci.lower, path_d21$ci.lower,
                path_b1$ci.lower, path_b2$ci.lower, path_c$ci.lower,
                ind1$ci.lower, ind2$ci.lower, ind3$ci.lower,
-               total_ind$ci.lower, total_eff$ci.lower,
-               prop_med$ci.lower, serial_prop$ci.lower),
+               total_ind$ci.lower, total_eff$ci.lower),
   CI_Upper = c(path_a1$ci.upper, path_a2$ci.upper, path_d21$ci.upper,
                path_b1$ci.upper, path_b2$ci.upper, path_c$ci.upper,
                ind1$ci.upper, ind2$ci.upper, ind3$ci.upper,
-               total_ind$ci.upper, total_eff$ci.upper,
-               prop_med$ci.upper, serial_prop$ci.upper),
+               total_ind$ci.upper, total_eff$ci.upper),
   p_value = c(path_a1$pvalue, path_a2$pvalue, path_d21$pvalue,
               path_b1$pvalue, path_b2$pvalue, path_c$pvalue,
               ind1$pvalue, ind2$pvalue, ind3$pvalue,
-              total_ind$pvalue, total_eff$pvalue, NA, NA),
+              total_ind$pvalue, total_eff$pvalue),
   Significant = c(path_a1$pvalue < 0.05, path_a2$pvalue < 0.05,
                   path_d21$pvalue < 0.05, path_b1$pvalue < 0.05,
                   path_b2$pvalue < 0.05, path_c$pvalue < 0.05,
                   ind1$pvalue < 0.05, ind2$pvalue < 0.05, ind3$pvalue < 0.05,
-                  total_ind$pvalue < 0.05, total_eff$pvalue < 0.05, NA, NA),
+                  total_ind$pvalue < 0.05, total_eff$pvalue < 0.05),
   N              = n_complete,
   Bootstrap_iter = bootstrap_iter
 )
@@ -142,12 +141,11 @@ write_csv(results_table,
 nodes_df <- data.frame(
   x     = c(1, 4, 7, 10),
   y     = c(3, 4.5, 4.5, 3),
-  label = c("LEDD\n(Medication)", "WOQ9\n(Motor\nFluctuations)",
-            "NMS\n(Mood-Cog\nHub)", "PDQ39\n(Quality\nof Life)"),
+  label = c("LEDD", "WOQ-9\nTotal", "NMSQuest\nMood/Cognition", "PDQ-39 SI"),
   color = c("#E8F4F8", "#FFF4E6", "#FFE6E6", "#E8F5E8")
 )
 
-star <- function(p) ifelse(p < 0.05, "***", "")
+star <- function(p) ifelse(is.na(p), "", ifelse(p < .001, "***", ifelse(p < .01, "**", ifelse(p < .05, "*", ""))))
 
 arrows_df <- data.frame(
   x    = c(1, 4, 7, 4, 1, 1),
@@ -184,9 +182,10 @@ path_diagram <- ggplot() +
   scale_linetype_manual(values = c(Serial = 1, Direct = 2, `Direct M2` = 3)) +
   scale_linewidth_manual(values = c(Serial = 1.2, Direct = 0.8, `Direct M2` = 0.8)) +
   xlim(0, 11) + ylim(1.5, 6) +
-  labs(title    = "Serial Mediation Pathway",
-       subtitle = sprintf("Indirect serial effect: beta = %.3f [%.3f, %.3f], p = %.3f",
-                          ind2$est, ind2$ci.lower, ind2$ci.upper, ind2$pvalue)) +
+  labs(title = "Exploratory cross-sectional serial model",
+       subtitle = sprintf("Serial indirect association: beta = %.3f [%.3f, %.3f], p = %.3f",
+                          ind2$est, ind2$ci.lower, ind2$ci.upper, ind2$pvalue),
+       caption = "Arrows specify regression equations. * p < .05; ** p < .01; *** p < .001 (nominal Wald tests).") +
   theme_void() +
   theme(plot.title    = element_text(face = "bold", size = 16, hjust = 0.5),
         plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray30"),
@@ -202,12 +201,10 @@ ggsave(path_file, path_diagram, width = 14, height = 8,
 # ---- Figure S2: forest plot of standardized paths ----
 
 plot_data <- results_table %>%
-  filter(!grepl("Proportion|Total Effect", Path)) %>%
   mutate(
     Path_Type = case_when(
-      grepl("Indirect", Path) ~ "Indirect Effects",
-      grepl("c'",       Path) ~ "Direct Effect",
-      TRUE                    ~ "Component Paths"
+      grepl("[Ii]ndirect|^Total association", Path) ~ "Indirect and total associations",
+      TRUE ~ "Component paths"
     ),
     Path_Clean      = gsub(".*: ", "", Path),
     Significant_cat = ifelse(Significant, "p < 0.05", "p >= 0.05")
@@ -228,7 +225,7 @@ forest_plot <- ggplot(plot_data, aes(reorder(Path_Clean, Beta_Standardized),
   coord_flip() +
   facet_wrap(~ Path_Type, scales = "free_y", ncol = 1) +
   labs(x = NULL, y = "Standardized beta (95% CI)",
-       title    = "Serial mediation: LEDD -> WOQ9 -> NMS_mood -> PDQ39",
+       title    = "Cross-sectional serial model: LEDD -> WOQ-9 -> Mood/Cognition -> SI",
        subtitle = sprintf("N = %d, Bootstrap = %d", n_complete, bootstrap_iter)) +
   theme_minimal(base_size = 12) +
   theme(
@@ -249,3 +246,5 @@ forest_file <- file.path(OUTPUT_DIR, "figures/supplement",
 ggsave(forest_file, forest_plot, width = 12, height = 10,
        dpi = if (export_pdf) 300 else png_dpi,
        bg = if (export_pdf) "transparent" else "white")
+write_csv(params, file.path(OUTPUT_DIR, "tables", "serial_all_parameters.csv"))
+pd_finish("step3")

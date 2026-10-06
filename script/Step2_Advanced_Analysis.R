@@ -1,10 +1,13 @@
 # Step 2: dyadic and secondary analyses
-# Part 1 - NCT for SES moderation on a 10-node core network
-# Part 2 - patient-centered actor-partner model (NMS_mood -> ZBI / PDQ39_SI)
-# Part 3 - caregiver-patient discrepancy (incremental, directional, residual)
+# Part 1 - exploratory SES comparison on a 10-node network
+# Part 2 - patient-centered joint-outcome models
+# Part 3 - constructed absolute and signed score differences
+source("script/Step0_DataPreparation.R")
 
 suppressPackageStartupMessages({
-  library(tidyverse)
+  library(dplyr)
+  library(readr)
+  library(ggplot2)
   library(bootnet)
   library(NetworkComparisonTest)
   library(lavaan)
@@ -14,17 +17,14 @@ suppressPackageStartupMessages({
 
 # ---- config ----
 
-INPUT_PATIENTS <- "analysis_patients.csv"
-INPUT_PAIRS    <- "analysis_pairs.csv"
-STEP1_RESULTS  <- "results_network_analysis/data_processed/step1_results.RData"
-OUTPUT_DIR     <- "results_network_analysis"
+OUTPUT_DIR     <- PD_OUTPUT_DIR
 
 set.seed(2024)
-nct_iter           <- 1000
+nct_iter           <- pd_count("PD_NCT_PERMUTATIONS", 1000)
 nct_gamma          <- 0.5
 nct_cor_method     <- "cor_auto"
-sem_bootstrap      <- 2000
-mismatch_bootstrap <- 2000
+sem_bootstrap      <- pd_count("PD_DYAD_BOOTSTRAP", 2000)
+mismatch_bootstrap <- pd_count("PD_DIFFERENCE_BOOTSTRAP", 2000)
 export_pdf         <- TRUE
 png_dpi            <- 600
 
@@ -32,9 +32,9 @@ for (sub in c("figures/main", "figures/supplement", "tables", "data_processed"))
   dir.create(file.path(OUTPUT_DIR, sub), showWarnings = FALSE, recursive = TRUE)
 }
 
-if (file.exists(STEP1_RESULTS)) load(STEP1_RESULTS)
-patients <- read_csv(INPUT_PATIENTS, show_col_types = FALSE)
-pairs    <- read_csv(INPUT_PAIRS,    show_col_types = FALSE)
+patients <- pd_patients
+pairs <- pd_pairs
+if (is.null(pairs)) stop("Step 2 requires analysis_pairs.csv.")
 
 # ---- 10-node core for NCT ----
 
@@ -77,9 +77,8 @@ patients <- patients %>%
 # Part 1: NCT for SES moderation
 # =========================================================================
 
-nct_data <- patients %>%
-  dplyr::select(ID, SES_Group, all_of(core_10_nodes)) %>%
-  na.omit()
+nct_data <- pd_complete(patients, c("ID", "SES_Group", core_10_nodes), "SES_network_10") %>%
+  dplyr::select(ID, SES_Group, all_of(core_10_nodes))
 
 n_high <- sum(nct_data$SES_Group == "High")
 n_low  <- sum(nct_data$SES_Group == "Low")
@@ -91,10 +90,11 @@ data_low  <- nct_data %>% filter(SES_Group == "Low")  %>%
 
 nct_result <- NetworkComparisonTest::NCT(
   data_high, data_low,
+  gamma = nct_gamma,
   it = nct_iter,
   binary.data = FALSE, paired = FALSE, weighted = TRUE,
   test.edges = TRUE, edges = "all",
-  progressbar = TRUE, make.positive.definite = TRUE,
+  progressbar = FALSE, make.positive.definite = TRUE,
   p.adjust.methods = "none",
   test.centrality = TRUE,
   centrality = c("strength", "betweenness", "closeness")
@@ -112,57 +112,71 @@ edge_diffs_fdr <- if (!is.null(nct_result$einv.pvals))
   p.adjust(nct_result$einv.pvals$`p-value`, method = "fdr") else NULL
 
 nct_summary <- tibble(
-  Test       = c("Global Strength", "Edge Differences (FDR)"),
-  High_SES   = c(gs_high, NA),
-  Low_SES    = c(gs_low,  NA),
-  Difference = c(gs_high - gs_low, NA),
-  p_value    = c(nct_result$glstrinv.pval,
-                 if (!is.null(edge_diffs_fdr)) sum(edge_diffs_fdr < 0.05) else NA)
+  Test = c("Global strength", "Network structure"),
+  n_high = n_high, n_low = n_low,
+  statistic = c(nct_result$glstrinv.real, nct_result$nwinv.real),
+  p_value = c(nct_result$glstrinv.pval, nct_result$nwinv.pval),
+  NCT_high_global_strength = nct_result$glstrinv.sep[1],
+  NCT_low_global_strength = nct_result$glstrinv.sep[2],
+  cor_auto_high_global_strength = gs_high, cor_auto_low_global_strength = gs_low,
+  edges_FDR_below_05 = if (!is.null(edge_diffs_fdr)) sum(edge_diffs_fdr < .05) else NA_integer_
 )
+if (abs(abs(diff(nct_result$glstrinv.sep)) - nct_result$glstrinv.real) > 1e-8) {
+  stop("NCT strengths and global-strength statistic disagree.")
+}
 write_csv(nct_summary, file.path(OUTPUT_DIR, "tables", "nct_ses_summary.csv"))
+if (!is.null(edge_diffs_fdr)) {
+  edge_table <- nct_result$einv.pvals
+  edge_table$p_FDR <- edge_diffs_fdr
+  write_csv(edge_table, file.path(OUTPUT_DIR, "tables", "nct_edges_FDR.csv"))
+}
 save(nct_result, file = file.path(OUTPUT_DIR, "data_processed",
                                   "nct_ses_moderation.RData"))
 
 # =========================================================================
-# Part 2: Patient-centered APIM (NMS_mood -> PDQ39_SI / ZBI)
+# Part 2: Patient-centered joint-outcome models
 # =========================================================================
 
-sem_data <- pairs %>%
-  dplyr::select(any_of(c("ID", "NMS_mood", "PDQ39_SI",
-                         "ZBI_score", "disease_duration"))) %>%
-  na.omit() %>%
-  mutate(across(where(is.numeric) & !matches("^ID$"),
-                ~ as.numeric(scale(.)),
-                .names = "{.col}_z"))
-
-apim_model <- '
-  PDQ39_SI_z  ~ a1*NMS_mood_z + disease_duration_z   # Actor:   patient mood -> patient HRQoL
-  ZBI_score_z ~ p1*NMS_mood_z + disease_duration_z   # Partner: patient mood -> caregiver burden
-'
-
-sem_apim <- sem(apim_model, data = sem_data,
-                se = "bootstrap", bootstrap = sem_bootstrap, verbose = FALSE)
-
-apim_params <- parameterEstimates(sem_apim, boot.ci.type = "perc") %>%
-  filter(op == "~", lhs %in% c("PDQ39_SI_z", "ZBI_score_z")) %>%
-  mutate(Effect_Type = if_else(lhs == "PDQ39_SI_z", "Actor", "Partner")) %>%
-  dplyr::select(Effect_Type, Predictor = rhs, Beta = est, SE = se,
-                CI_Lower = ci.lower, CI_Upper = ci.upper, p = pvalue)
-
-apim_results <- apim_params %>%
-  filter(Predictor == "NMS_mood_z") %>%
-  mutate(Model = "APIM (NMS_mood -> ZBI, control: duration)", .before = 1)
-write_csv(apim_results, file.path(OUTPUT_DIR, "tables", "apim_sem_results.csv"))
+covariates <- list(duration_only = "disease_duration",
+  age_sex_duration = c("disease_duration", "age", "sex_male"))
+functional <- c("balance_difficulty", "unable_independent_walk_stand")
+if (all(functional %in% names(pairs))) {
+  covariates$add_balance_difficulty <- c(covariates$age_sex_duration, functional[1])
+  covariates$add_inability_walk_stand <- c(covariates$age_sex_duration, functional[2])
+} else {
+  warning("Functional inputs unavailable: the two functional-covariate models were not fitted.")
+}
+dyadic_results <- list()
+for (name in names(covariates)) {
+  variables <- c("NMS_mood", "PDQ39_SI", "ZBI_score", covariates[[name]])
+  sem_data <- pd_complete(pairs, variables, paste0("dyadic_", name))
+  continuous <- intersect(c("NMS_mood", "PDQ39_SI", "ZBI_score", "disease_duration", "age"), variables)
+  for (v in continuous) sem_data[[paste0(v, "_z")]] <- pd_z(sem_data[[v]])
+  covs <- ifelse(covariates[[name]] %in% continuous,
+    paste0(covariates[[name]], "_z"), covariates[[name]])
+  rhs <- paste(c("NMS_mood_z", covs), collapse = " + ")
+  model <- paste("PDQ39_SI_z ~", rhs, "\nZBI_score_z ~", rhs,
+                  "\nPDQ39_SI_z ~~ ZBI_score_z")
+  fit <- pd_fit_sem(model, sem_data, name, sem_bootstrap)
+  parameters <- parameterEstimates(fit, boot.ci.type = "perc") %>%
+    filter(op == "~") %>% mutate(model = name, n = nrow(sem_data), .before = 1)
+  dyadic_results[[name]] <- parameters
+}
+dyadic_all <- bind_rows(dyadic_results)
+write_csv(dyadic_all, file.path(OUTPUT_DIR, "tables", "dyadic_all_paths.csv"))
+write_csv(filter(dyadic_all, rhs == "NMS_mood_z"),
+  file.path(OUTPUT_DIR, "tables", "dyadic_mood_associations.csv"))
 
 # =========================================================================
 # Part 3: Caregiver-patient discrepancy
 # =========================================================================
 
-mismatch_data_z <- pairs %>%
-  dplyr::select(any_of(c("ID", "ZBI_score",
+discrepancy_columns <- c("ID", "ZBI_score",
                          "DASS_depression", "DASS_anxiety", "DASS_stress",
-                         "PDQ39_communication", "PDQ39_emotional", "NMS_mood"))) %>%
-  na.omit() %>%
+                         "PDQ39_communication", "PDQ39_emotional", "NMS_mood")
+set.seed(2024)
+mismatch_data_z <- pd_complete(pairs, discrepancy_columns, "constructed_differences") %>%
+  dplyr::select(all_of(discrepancy_columns)) %>%
   mutate(
     DASS_total       = DASS_depression + DASS_anxiety + DASS_stress,
     PDQ_psychosocial = (PDQ39_communication + PDQ39_emotional) / 2,
@@ -170,15 +184,13 @@ mismatch_data_z <- pairs %>%
     DASS_total_z       = as.numeric(scale(DASS_total)),
     PDQ_psychosocial_z = as.numeric(scale(PDQ_psychosocial)),
     NMS_mood_z         = as.numeric(scale(NMS_mood)),
-    # Interaction-salient pathway: PDQ-39 communication+emotional vs DASS
     mismatch_psysoc = abs(DASS_total_z - PDQ_psychosocial_z),
     signed_psysoc   =     DASS_total_z - PDQ_psychosocial_z,
-    # Internal-symptom pathway: NMS mood/cognition vs DASS
     mismatch_biosoc = abs(DASS_total_z - NMS_mood_z),
     signed_biosoc   =     DASS_total_z - NMS_mood_z
   )
 
-# Hierarchical regression: incremental ΔR² of mismatch beyond main effects
+# The index is a nonlinear function of the two component scores.
 incremental_test <- function(data, patient_var, caregiver_var, mismatch_var,
                              outcome_var = "ZBI_score_z",
                              n_boot = mismatch_bootstrap) {
@@ -218,10 +230,10 @@ incremental_test <- function(data, patient_var, caregiver_var, mismatch_var,
 
 incr_psysoc <- incremental_test(mismatch_data_z, "PDQ_psychosocial_z",
                                 "DASS_total_z", "mismatch_psysoc") %>%
-  mutate(Pathway = "Psychosocial", .before = 1)
+  mutate(Comparison = "PDQ composite", .before = 1)
 incr_biosoc <- incremental_test(mismatch_data_z, "NMS_mood_z",
                                 "DASS_total_z", "mismatch_biosoc") %>%
-  mutate(Pathway = "Biological", .before = 1)
+  mutate(Comparison = "NMS mood/cognition", .before = 1)
 
 write_csv(bind_rows(incr_psysoc, incr_biosoc),
           file.path(OUTPUT_DIR, "tables", "mismatch_incremental_validity.csv"))
@@ -231,14 +243,14 @@ directional_test <- function(data, signed_var, outcome_var = "ZBI_score_z") {
   df <- data %>%
     dplyr::select(all_of(c(outcome_var, signed_var))) %>%
     na.omit()
-  ct <- cor.test(df[[signed_var]], df[[outcome_var]], method = "spearman")
+  ct <- cor.test(df[[signed_var]], df[[outcome_var]], method = "spearman", exact = FALSE)
   tibble(N = nrow(df), Spearman_r = ct$estimate, p_value = ct$p.value)
 }
 
 dir_psysoc <- directional_test(mismatch_data_z, "signed_psysoc") %>%
-  mutate(Pathway = "Psychosocial", .before = 1)
+  mutate(Comparison = "PDQ composite", .before = 1)
 dir_biosoc <- directional_test(mismatch_data_z, "signed_biosoc") %>%
-  mutate(Pathway = "Biological",   .before = 1)
+  mutate(Comparison = "NMS mood/cognition", .before = 1)
 
 write_csv(bind_rows(dir_psysoc, dir_biosoc),
           file.path(OUTPUT_DIR, "tables", "mismatch_directional_effects.csv"))
@@ -257,12 +269,12 @@ mismatch_data_z <- mismatch_data_z %>%
 
 resid_psysoc <- incremental_test(mismatch_data_z, "PDQ_psychosocial_z",
                                  "DASS_total_z", "mismatch_psysoc_resid",
-                                 n_boot = 1000) %>%
-  mutate(Pathway = "Psychosocial (Residual)", .before = 1)
+                                 n_boot = pd_count("PD_RESIDUAL_BOOTSTRAP", 1000)) %>%
+  mutate(Comparison = "PDQ composite (absolute residual)", .before = 1)
 resid_biosoc <- incremental_test(mismatch_data_z, "NMS_mood_z",
                                  "DASS_total_z", "mismatch_biosoc_resid",
-                                 n_boot = 1000) %>%
-  mutate(Pathway = "Biological (Residual)", .before = 1)
+                                 n_boot = pd_count("PD_RESIDUAL_BOOTSTRAP", 1000)) %>%
+  mutate(Comparison = "NMS mood/cognition (absolute residual)", .before = 1)
 
 write_csv(bind_rows(resid_psysoc, resid_biosoc),
           file.path(OUTPUT_DIR, "tables", "mismatch_sensitivity.csv"))
@@ -290,18 +302,18 @@ mismatch_scatter <- function(xvar, yvar, title, xlab, ylab, dr2, p) {
     labs(title = title, x = xlab, y = ylab) +
     theme_pub() +
     annotate("text", x = Inf, y = Inf,
-             label = sprintf("Delta R^2 = %.3f, p = %.3f", dr2, p),
+             label = sprintf("Adjusted increment: Delta R^2 = %.3f, p = %.3f", dr2, p),
              hjust = 1.1, vjust = 1.5, size = 3.5, fontface = "italic")
 }
 
 fig_psysoc <- mismatch_scatter("mismatch_psysoc", "ZBI_score_z",
-                               "A. Psychosocial pathway",
-                               "Dyadic mismatch (absolute difference)",
+                               "A. DASS total versus PDQ composite",
+                               "Absolute standardized-score difference",
                                "Caregiver burden (z-score)",
                                incr_psysoc$Delta_R2, incr_psysoc$p_Delta_R2)
 fig_biosoc <- mismatch_scatter("mismatch_biosoc", "ZBI_score_z",
-                               "B. Biological pathway",
-                               "Dyadic mismatch (absolute difference)",
+                               "B. DASS total versus NMS mood/cognition",
+                               "Absolute standardized-score difference",
                                NULL,
                                incr_biosoc$Delta_R2, incr_biosoc$p_Delta_R2)
 
@@ -312,3 +324,4 @@ if (export_pdf) {
   ggsave(file.path(OUTPUT_DIR, "figures/main", "Figure2_Dyadic_Mismatch.pdf"),
          fig_mismatch, width = 10, height = 4.5, dpi = 300)
 }
+pd_finish("step2")

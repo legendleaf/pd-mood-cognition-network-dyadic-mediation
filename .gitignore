@@ -1,13 +1,37 @@
 # Participant-level analysis data
 analysis_*.csv
-data/*.csv
-data/*.tsv
-data/*.xlsx
+data/**
+!data/README.md
+private/
+inputs/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.sav
+*.dta
+*.parquet
 
 # Derived objects that may contain participant-level data
 *.RData
-results_network_analysis/data_processed/
+*.Rdata
+*.rds
+*.rda
+results_network_analysis/
+results/
+outputs/
+figures/
+logs/
+r_library/
+*.zip
 
 # Local/session files
 .Rhistory
+.Rproj.user/
+.Renviron
+.Rprofile
+__pycache__/
+*.pyc
+.env
+.env.*
 自用/

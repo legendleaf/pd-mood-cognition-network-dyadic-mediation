@@ -1,22 +1,22 @@
 # Step 1: 16-node EBICglasso symptom network
+source("script/Step0_DataPreparation.R")
 
 suppressPackageStartupMessages({
-  library(tidyverse)
+  library(dplyr)
+  library(readr)
+  library(ggplot2)
   library(qgraph)
   library(bootnet)
   library(networktools)
-  library(showtext)
-  library(sysfonts)
 })
 
 # ---- config ----
 
-INPUT_PATIENTS <- "analysis_patients.csv"
-OUTPUT_DIR     <- "results_network_analysis"
+OUTPUT_DIR     <- PD_OUTPUT_DIR
 
 set.seed(2024)
-boot_iter   <- 1000
-case_iter   <- 500
+boot_iter   <- pd_count("PD_NETWORK_BOOTSTRAP", 1000)
+case_iter   <- pd_count("PD_CASE_BOOTSTRAP", 500)
 ebic_gamma  <- 0.5
 cor_method  <- "cor_auto"
 export_pdf  <- TRUE
@@ -26,11 +26,9 @@ for (sub in c("figures/main", "figures/supplement", "tables", "data_processed"))
   dir.create(file.path(OUTPUT_DIR, sub), showWarnings = FALSE, recursive = TRUE)
 }
 
-tryCatch({ font_add("Arial", "arial.ttf"); showtext_auto() }, error = function(e) NULL)
-
 # ---- data ----
 
-patients <- read_csv(INPUT_PATIENTS, show_col_types = FALSE)
+patients <- pd_patients
 
 network_variables <- c(
   "PDQ39_mobility", "PDQ39_adl", "PDQ39_emotional", "PDQ39_cognition",
@@ -40,9 +38,8 @@ network_variables <- c(
   "WOQ9_total"
 )
 
-network_data <- patients %>%
-  dplyr::select(ID, all_of(network_variables)) %>%
-  na.omit()
+network_data <- pd_complete(patients, c("ID", network_variables), "network_16") %>%
+  dplyr::select(ID, all_of(network_variables))
 
 n_complete <- nrow(network_data)
 
@@ -81,11 +78,30 @@ write_csv(bridge_df, file.path(OUTPUT_DIR, "tables", "bridge_centrality.csv"))
 
 # ---- bootstrap stability ----
 
-boot_result <- bootnet(net_result, nBoots = boot_iter, type = "nonparametric",
-                       statistics = c("edge", "strength", "closeness", "betweenness"))
-
-boot_case <- bootnet(net_result, nBoots = case_iter, type = "case",
-                     statistics = c("strength", "closeness", "betweenness"))
+archive_path <- Sys.getenv("PD_NETWORK_ARCHIVE")
+if (nzchar(archive_path)) {
+  archived <- new.env()
+  pd_input_hashes[archive_path] <- unname(tools::md5sum(archive_path))
+  load(archive_path, envir = archived)
+  old_matrix <- as.matrix(archived$net_result$data)
+  centered_current <- sweep(as.matrix(network_matrix), 2, colMeans(network_matrix))
+  centered_old <- sweep(old_matrix, 2, colMeans(old_matrix))
+  stopifnot(identical(network_variables, archived$network_variables),
+    nrow(network_matrix) == nrow(archived$net_result$data),
+    max(abs(centered_current - centered_old)) < 1e-10,
+    max(abs(as.matrix(cor(network_matrix)) - cor(archived$net_result$data))) < 1e-10,
+    max(abs(adj_matrix - archived$adj_matrix)) < 1e-6,
+    length(archived$boot_result$boots) == boot_iter,
+    length(archived$boot_case$boots) == case_iter)
+  boot_result <- archived$boot_result
+  boot_case <- archived$boot_case
+} else {
+  set.seed(2024)
+  boot_result <- bootnet(net_result, nBoots = boot_iter, type = "nonparametric",
+                         statistics = c("edge", "strength", "closeness", "betweenness"))
+  boot_case <- bootnet(net_result, nBoots = case_iter, type = "case",
+                       statistics = c("strength", "closeness", "betweenness"))
+}
 
 cs_coef <- corStability(boot_case)["strength"]
 
@@ -104,10 +120,10 @@ official_labels_map <- c(
   NMS_gi              = "Gastrointestinal",
   NMS_urinary         = "Urinary",
   NMS_cardiovascular  = "Cardiovascular",
-  NMS_perception      = "Hallucinations",
+  NMS_perception      = "Perceptual-Hallucinations",
   NMS_sexual          = "Sexual",
   NMS_misc            = "Pain-Misc",
-  WOQ9_total          = "Wearing-Off"
+  WOQ9_total          = "WOQ-9"
 )
 
 adj <- as.matrix(net_result$graph); diag(adj) <- 0
@@ -165,7 +181,7 @@ dev.off()
 get_group <- function(name) {
   if (name %in% c("Mobility", "ADL", "Emotional", "Cognition",
                   "Social", "Communication", "Stigma")) return("PDQ-39")
-  if (name == "Wearing-Off") return("WOQ-9")
+  if (name == "WOQ-9") return("WOQ-9")
   "NMS"
 }
 
@@ -234,7 +250,7 @@ print(
     theme_minimal(base_family = "Arial", base_size = 14) +
     labs(title    = "Network Stability Analysis",
          subtitle = sprintf("Case-dropping bootstrap | CS-coefficient = %.3f", cs_coef),
-         x = "Proportion of Cases Dropped",
+         x = "Proportion of Cases Retained",
          y = "Average Correlation with Original Centrality")
 )
 dev.off()
@@ -244,3 +260,7 @@ dev.off()
 save(net_result, GLOBAL_MAX_STRENGTH, network_variables, network_data,
      adj_matrix, official_labels_map, cs_coef, boot_result, boot_case,
      file = file.path(OUTPUT_DIR, "data_processed", "step1_results.RData"))
+write.csv(data.frame(n = n_complete, nodes = length(network_variables), edges = n_edges,
+  sparsity = sparsity, strength_CS = unname(cs_coef)),
+  file.path(OUTPUT_DIR, "tables", "network_summary.csv"), row.names = FALSE)
+pd_finish("step1")
